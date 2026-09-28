@@ -104,6 +104,8 @@ python -c "from rapid_paraformer import download_hf_model; download_hf_model(rep
 | `--model` | FunASR 模型名，默认 `paraformer-zh` |
 | `--no-punc` | 关闭断句（默认**开启**标点恢复） |
 | `--vad` | 加载 fsmn-vad，支持长音频自动切分 |
+| `--no-silence-gate` | 关闭**静音门限**（默认开启，防幻觉，见第 7 节） |
+| `--min-speech-sec` | 判定「有语音」所需最短有效语音时长（秒），默认 `0.2` |
 
 示例：
 
@@ -111,6 +113,7 @@ python -c "from rapid_paraformer import download_hf_model; download_hf_model(rep
 .venv\Scripts\python.exe asr_server.py --port 9000      :: 换端口
 .venv\Scripts\python.exe asr_server.py --no-punc        :: 不要标点
 .venv\Scripts\python.exe asr_server.py --vad            :: 长音频切分
+.venv\Scripts\python.exe asr_server.py --no-silence-gate :: 关闭静音门限
 ```
 
 ### 3.2 一键启动（演示用）
@@ -203,7 +206,38 @@ RapidASR 版不具备此能力，**需要通顺句子时优先用本 FunASR 版�
 
 ---
 
-## 7. 命令行脚本（批量 / 手工处理）
+## 7. 静音门限（防「幻觉文本」）
+
+**问题**：Paraformer 对**几乎没有语音**的输入会产生**幻觉文本**——空白、底噪、
+按键咔哒声都可能被「编」成几个字。实测一段 540ms、96% 是静音的片段，被识别成
+`这个这的这的e个。`，等于凭空造出一句话，下游拿到就是脏数据。
+
+**解决**：服务端在**推理之前**做能量门限判断（纯计算，不加载额外模型，成本可忽略）：
+
+1. 按 25ms 窗 / 10ms 步分帧，逐帧算 RMS；
+2. 以帧能量的第 10 百分位作**噪声底**，门限 = `max(-45dBFS, 噪声底 + 8dB)`；
+3. 统计「有效语音总时长」与「有效语音帧占比」；
+4. 若 时长 < 0.2s **或** 占比 < 5%，判定该段无语音 → **直接返回空文本，不喂给模型**。
+
+实测效果：
+
+| 输入 | 结果 |
+| --- | --- |
+| 纯静音 540ms | `{"text":""}` — 不识别 |
+| 低幅底噪 2s | `{"text":""}` — 不识别 |
+| 只有按键咔哒 540ms | `{"text":""}` — 不识别（**修复了原幻觉**） |
+| 真实语音 5.5s | `欢迎大家来体验达摩院推出的语音识别模型。` — 正常 |
+
+**调节方式**：
+
+- 说话很轻、很短被判成静音 → 调低阈值：`--min-speech-sec 0.1`
+- 想完全关掉门限 → `--no-silence-gate`
+- 离线自测（不启动服务）：`.venv\Scripts\python.exe test_silence_gate.py`
+  （7 个用例，全部 PASS 即正常）
+
+---
+
+## 8. 命令行脚本（批量 / 手工处理）
 
 | 脚本 | 说明 |
 | --- | --- |
@@ -224,17 +258,21 @@ RapidASR 版不具备此能力，**需要通顺句子时优先用本 FunASR 版�
 
 ---
 
-## 8. 目录结构（本仓库新增 / 改动部分）
+## 9. 目录结构（本仓库新增 / 改动部分）
 
 ```
 FunASR/
-├── asr_server.py          # FastAPI 服务（18466，断句默认开，支持 PCM）
+├── asr_server.py          # FastAPI 服务（18466，断句默认开，支持 PCM，含静音门限）
 ├── funasr_cli.py          # FunASR 引擎命令行识别
 ├── rapid_asr_cli.py       # RapidASR 引擎命令行识别
 ├── test_cpu_asr.py        # 最小冒烟测试
+├── test_silence_gate.py   # 静音门限离线自测（7 用例）
 ├── start_asr_server.bat   # 一键启动（杀旧进程+启动+开 Swagger+暂停）
+├── push_to_github.bat     # 一键推送到本 fork（本机 git 直推）
+├── push_via_api.py        # 走 GitHub API 推送（git 协议被墙时的备用通道）
+├── cleanup_branches.py    # 清理 fork 中继承自上游的多余分支
 ├── static/                # 离线 Swagger 资源（swagger-ui-bundle.js / .css）
-├── asr_example_zh.wav     # 示例音频（10s 中文）
+├── asr_example_zh.wav     # 示例音频（约 5.5s 中文）
 ├── README_ASR_SERVER.md   # 本文档
 ├── .venv/                 # 虚拟环境（已 gitignore，不入库）
 └── rapid_asr_models/      # RapidASR 模型（可选，已 gitignore，不入库）
@@ -242,8 +280,11 @@ FunASR/
 
 ---
 
-## 9. 常见问题
+## 10. 常见问题
 
+- **Q：麦克风没说话，也识别出文字？**
+  这是 Paraformer 的幻觉输出，本服务已用**静音门限**解决（见第 7 节）。
+  若仍出现，可把阈值调高：`--min-speech-sec 0.3`；并确认没加 `--no-silence-gate`。
 - **Q：提示 `torch` 不是 CPU 版 / 想确认？**
   跑 `python -c "import torch; print(torch.__version__, torch.cuda.is_available())"`，
   版本带 `+cpu` 且 `cuda_available=False` 即为 CPU 版。
@@ -257,6 +298,8 @@ FunASR/
 
 ---
 
-> 仓库：`FreeCodeCampXYG/starline-funasr`（Fork 自 modelscope/FunASR）。
+> 仓库：`FreeCodeCampXYG/starline-funasr`（Fork 自 modelscope/FunASR，仅保留 `main` 一个分支）。
 > 本仓库的 **`main` 分支即包含上述全部改动**（默认分支，访客进来看到的就是带 ASR 服务的版本），
-> 不向上游 modelscope/FunASR 提 PR/issue。本地推送命令见根目录 `push_to_github.bat`。
+> 不向上游 modelscope/FunASR 提 PR/issue。
+> 推送命令见根目录 `push_to_github.bat`（本机 git 直推）；
+> 若本机代理挡掉了 `github.com` 的 git 协议，改用 `python push_via_api.py --squash`。

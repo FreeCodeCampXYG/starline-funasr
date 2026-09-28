@@ -31,6 +31,7 @@ FILES = [
     "README_ASR_SERVER.md",
     "asr_server.py",
     "asr_example_zh.wav",
+    "cleanup_branches.py",
     "funasr_cli.py",
     "push_to_github.bat",
     "push_via_api.py",
