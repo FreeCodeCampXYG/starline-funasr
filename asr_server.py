@@ -26,11 +26,12 @@
     .venv/Scripts/python.exe asr_server.py --vad       # 加载 fsmn-vad，支持长音频
     .venv/Scripts/python.exe asr_server.py --no-silence-gate   # 关闭静音门限
 
-静音门限（默认开启）：
-    Paraformer 对近乎空白的输入会产生幻觉文本（如 540ms 中 96% 静音的片段
-    被编成「这个这的这的e个。」）。服务端在推理前统计有效语音时长与占比，
-    低于门限的整段直接返回空文本，不喂给模型。门限可用 --min-speech-sec 调整，
-    或 --no-silence-gate 整体关闭。
+静音门限（默认开启，基于 VAD）：
+    Paraformer 对「几乎没有语音」的输入会产生幻觉文本（实测纯静音输出
+    「没有没有有」、按键咔哒输出「退出hello hello」）。服务端在推理前先用
+    FunASR 官方 fsmn-vad 判断是否含人声（训练模型，非能量/频率阈值猜测），
+    语音总时长低于门限的整段直接返回空文本，不喂给模型。
+    门限可用 --min-speech-sec 调整，或 --no-silence-gate 整体关闭。
 
 与 RapidASR 版（默认 18465）端口错开，两台服务可同时运行；
 客户端只需改端口号即可在两个引擎之间切换。
@@ -68,6 +69,11 @@ logger = logging.getLogger("funasr_server")
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
+# 模型缓存目录固定到项目内（默认 modelscope 会下到 C:\Users\<user>\.cache\modelscope，
+# 2GB+ 容易撑爆 C 盘）。必须在首次调用 funasr.AutoModel（模型下载/加载）之前设置。
+# 允许外部用 MODELSCOPE_CACHE 覆盖。
+os.environ.setdefault("MODELSCOPE_CACHE", str(BASE_DIR / ".models_cache"))
+
 # 单段音频解码后上限：300s × 16kHz × 4B(float32) ≈ 19.2MB，留余量挡异常大文件
 MAX_AUDIO_BYTES = 32 * 1024 * 1024
 TARGET_SR = 16000  # 模型输入采样率；固件协议同为 16kHz（16000Hz/320样本/20ms）
@@ -79,14 +85,21 @@ DEFAULT_MODEL = "paraformer-zh"
 _infer_lock = threading.Lock()
 _model = None
 _model_name = DEFAULT_MODEL
+_vad_model = None  # 静音门限用的 fsmn-vad（在 _lifespan 中按需加载）
 
 
 @asynccontextmanager
 async def _lifespan(_app):
-    global _model, _model_name
+    global _model, _model_name, _vad_model
     from funasr import AutoModel
 
     t0 = time.time()
+    # 静音门限用的 VAD（fsmn-vad，~1.7MB）：训练好的语音/非语音判别模型，
+    # 用于挡住按键咔哒/底噪等「有能量但非语音」的输入，同时不误杀弱语音。
+    if _GATE_ENABLED:
+        _vad_model = AutoModel(
+            model="fsmn-vad", device="cpu", disable_update=True, disable_pbar=True
+        )
     kwargs = dict(
         model=_model_name,
         device="cpu",
@@ -258,25 +271,57 @@ def _load_waveform(audio: bytes, sample_rate: int = TARGET_SR) -> np.ndarray:
     return waveform.astype(np.float32)[None, ...]
 
 
-# ---------------------------------------------------------------- 静音门限
-# Paraformer 对近乎空白的输入会产生「幻觉文本」：按下键到开口之间的空白、
-# 按键咔哒声，都可能被"编"成几个字（实测 540ms/静音 96% 的片段输出了
-# 「这个这的这的e个。」）。这里在推理前做能量门限：分帧求 RMS → 估噪声底 →
-# 统计有效语音时长与占比，低于门限的整段直接判为无语音，返回空文本。
+# ---------------------------------------------------------------- 静音门限（VAD）
+# Paraformer 对「几乎没有语音」的输入会产生幻觉文本：实测纯静音输出「没有没有有」、
+# 按键咔哒输出「退出hello hello」。仅靠能量阈值只能挡住「绝对安静」，挡不住按键
+# 咔哒这类**有能量但非语音**的输入，还可能误杀弱语音——所以改用训练好的 VAD。
+#
+# 正解：用 FunASR 官方 fsmn-vad 判「是不是人声」（基于 FBank 时频特征学习，而非
+# 拍脑袋的能量/频率阈值）。实测能拦下按键咔哒/底噪/纯静音，对弱语音(-25dB)、
+# 短语音仍灵敏不误杀。推理前先过 VAD：语音总时长 < 门限的整段判为无语音。
 
-SILENCE_DBFS = -45.0  # 绝对门限：帧能量低于此值视为静音
-SPEECH_MARGIN_DB = 8.0  # 相对门限：需高出噪声底这么多 dB 才算有效语音
-MIN_SPEECH_SEC = 0.2  # 有效语音最短总时长（秒）
-MIN_SPEECH_RATIO = 0.05  # 有效语音最低占比
+MIN_SPEECH_SEC = 0.2  # VAD 判定「有语音」所需的最短语音总时长（秒）
 
 _GATE_ENABLED = True
 
 
-def _speech_stats(waveform: np.ndarray) -> tuple[float, float]:
-    """能量门限统计。返回 (有效语音总时长秒, 有效语音帧占比)。
+def _vad_speech_sec(waveform: np.ndarray) -> float:
+    """用 fsmn-vad 求这段音频的语音总时长（秒）。
 
-    用累积和求滑动窗能量，O(n) 内存，长音频不会炸（25ms 窗 / 10ms 步）。
+    无 VAD 模型（未加载/已关闭门限）时返回 inf，表示「不拦截」。
     """
+    if _vad_model is None:
+        return float("inf")
+    x = waveform[0] if waveform.ndim > 1 else waveform
+    if x.size == 0:
+        return 0.0
+    res = _vad_model.generate(input=x)
+    segs = res[0].get("value", []) if res else []
+    return sum(e - s for s, e in segs) / 1000.0
+
+
+def _has_speech(waveform: np.ndarray) -> bool:
+    """判断这段音频是否含人声；纯静音/噪声/按键声直接跳过推理，防幻觉。"""
+    if not _GATE_ENABLED:
+        return True
+    sec = _vad_speech_sec(waveform)
+    if sec >= MIN_SPEECH_SEC:
+        return True
+    logger.info(
+        "fsmn-vad 判定为无有效语音，跳过推理：语音 %.2fs（门限 %.2fs）", sec, MIN_SPEECH_SEC
+    )
+    return False
+
+
+# ---- 以下为【旧方案：能量门限】保留供对照/回退，默认不再调用 ----
+# 实测缺点：挡不住有能量的按键咔哒（会输出幻觉），弱语音时占比偏低易误杀。
+SILENCE_DBFS = -45.0  # 绝对门限：帧能量低于此值视为静音
+SPEECH_MARGIN_DB = 8.0  # 相对门限：需高出噪声底这么多 dB 才算有效语音
+MIN_SPEECH_RATIO = 0.05  # 有效语音最低占比
+
+
+def _speech_stats(waveform: np.ndarray) -> tuple[float, float]:
+    """【旧】能量门限统计。返回 (有效语音总时长秒, 有效语音帧占比)。"""
     x = (waveform[0] if waveform.ndim > 1 else waveform).astype(np.float64)
     if x.size == 0:
         return 0.0, 0.0
@@ -301,24 +346,16 @@ def _speech_stats(waveform: np.ndarray) -> tuple[float, float]:
     return float(voiced.sum()) * hop / TARGET_SR, float(voiced.mean())
 
 
-def _has_speech(waveform: np.ndarray) -> bool:
-    """判断这段音频是否真的含有效语音；纯静音/噪声直接跳过推理。"""
-    if not _GATE_ENABLED:
-        return True
+def _has_speech_energy(waveform: np.ndarray) -> bool:
+    """【旧】能量门限判定，保留供对照；默认不再调用。"""
     speech_sec, ratio = _speech_stats(waveform)
-    if speech_sec >= MIN_SPEECH_SEC and ratio >= MIN_SPEECH_RATIO:
-        return True
-    logger.info(
-        "判定为无有效语音，跳过推理：有效 %.2fs（占比 %.0f%%；门限 %.2fs / %.0f%%）",
-        speech_sec, ratio * 100, MIN_SPEECH_SEC, MIN_SPEECH_RATIO * 100,
-    )
-    return False
+    return speech_sec >= MIN_SPEECH_SEC and ratio >= MIN_SPEECH_RATIO
 
 
 def _infer(audios: list[np.ndarray]) -> tuple[list[str], int]:
     """串行推理（funasr 模型非线程安全，加锁）。返回 (各段文本, 纯推理毫秒)。
 
-    静音段（能量门限未通过）不喂给模型，直接给空文本，避免幻觉输出。
+    静音段（VAD 门限未通过）不喂给模型，直接给空文本，避免幻觉输出。
     """
     assert _model is not None
     texts: list[str] = []

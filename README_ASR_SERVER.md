@@ -206,34 +206,40 @@ RapidASR 版不具备此能力，**需要通顺句子时优先用本 FunASR 版�
 
 ---
 
-## 7. 静音门限（防「幻觉文本」）
+## 7. 静音门限（防「幻觉文本」，基于 VAD）
 
 **问题**：Paraformer 对**几乎没有语音**的输入会产生**幻觉文本**——空白、底噪、
-按键咔哒声都可能被「编」成几个字。实测一段 540ms、96% 是静音的片段，被识别成
-`这个这的这的e个。`，等于凭空造出一句话，下游拿到就是脏数据。
+按键咔哒声都可能被「编」成几个字。实测纯静音被识别成 `没有没有有`、按键咔哒被
+识别成 `退出hello hello`，等于凭空造出一句话，下游拿到就是脏数据。
 
-**解决**：服务端在**推理之前**做能量门限判断（纯计算，不加载额外模型，成本可忽略）：
+**解决**：服务端在**推理之前**先用 **FunASR 官方 `fsmn-vad`**（训练好的语音/非语音
+判别模型，~1.7MB，首次运行自动下载到 `.models_cache`）判断这段音频是否含**人声**：
 
-1. 按 25ms 窗 / 10ms 步分帧，逐帧算 RMS；
-2. 以帧能量的第 10 百分位作**噪声底**，门限 = `max(-45dBFS, 噪声底 + 8dB)`；
-3. 统计「有效语音总时长」与「有效语音帧占比」；
-4. 若 时长 < 0.2s **或** 占比 < 5%，判定该段无语音 → **直接返回空文本，不喂给模型**。
+1. 对整段音频跑 fsmn-vad，得到若干语音区间（毫秒边界）；
+2. 累加语音区间总时长；
+3. 若 语音总时长 < `--min-speech-sec`（默认 0.2s），判定该段无语音 → **直接返回空文本，不喂给模型**。
 
-实测效果：
+> **为什么不用能量阈值**：早期版本用「分帧 RMS + 噪声底」做门限，实测**挡不住按键
+> 咔哒**这类「有能量但不是人声」的输入（持续咔哒 3s 会被放行，照样输出幻觉），
+> 也可能误杀弱语音。手写的能量/频率阈值本质是猜测；改用**训练好的 VAD** 才是正解。
 
-| 输入 | 结果 |
-| --- | --- |
-| 纯静音 540ms | `{"text":""}` — 不识别 |
-| 低幅底噪 2s | `{"text":""}` — 不识别 |
-| 只有按键咔哒 540ms | `{"text":""}` — 不识别（**修复了原幻觉**） |
-| 真实语音 5.5s | `欢迎大家来体验达摩院推出的语音识别模型。` — 正常 |
+实测效果（`.venv\Scripts\python.exe test_silence_gate.py`，8 个用例全部 PASS）：
+
+| 输入 | 旧能量门限 | fsmn-vad（现方案） |
+| --- | --- | --- |
+| 纯静音 540ms | 拦 ✅ | 拦 ✅ |
+| 低幅底噪 2s | 拦 ✅ | 拦 ✅ |
+| 按键咔哒 40ms | 拦 ✅ | 拦 ✅ |
+| **持续按键咔哒 3s** | **放行 ❌（输出幻觉）** | **拦 ✅** |
+| 真实语音 5.5s | 放行 ✅ | 放行 ✅ |
+| 真实语音 0.25s + 静音 1s | 放行（勉强） | 放行 ✅（更灵敏、不易误杀） |
 
 **调节方式**：
 
 - 说话很轻、很短被判成静音 → 调低阈值：`--min-speech-sec 0.1`
-- 想完全关掉门限 → `--no-silence-gate`
+- 想完全关掉门限 → `--no-silence-gate`（此时不再加载 VAD 模型）
 - 离线自测（不启动服务）：`.venv\Scripts\python.exe test_silence_gate.py`
-  （7 个用例，全部 PASS 即正常）
+  （8 个用例，全部 PASS 即正常）
 
 ---
 
@@ -266,14 +272,15 @@ FunASR/
 ├── funasr_cli.py          # FunASR 引擎命令行识别
 ├── rapid_asr_cli.py       # RapidASR 引擎命令行识别
 ├── test_cpu_asr.py        # 最小冒烟测试
-├── test_silence_gate.py   # 静音门限离线自测（7 用例）
-├── start_asr_server.bat   # 一键启动（杀旧进程+启动+开 Swagger+暂停）
+├── test_silence_gate.py   # 静音门限离线自测（VAD，8 用例）
+├── start_asr_server.bat   # 一键启动（杀旧进程→启动→等就绪→开 Swagger）
 ├── push_to_github.bat     # 一键推送到本 fork（本机 git 直推）
 ├── push_via_api.py        # 走 GitHub API 推送（git 协议被墙时的备用通道）
 ├── cleanup_branches.py    # 清理 fork 中继承自上游的多余分支
 ├── static/                # 离线 Swagger 资源（swagger-ui-bundle.js / .css）
 ├── asr_example_zh.wav     # 示例音频（约 5.5s 中文）
 ├── README_ASR_SERVER.md   # 本文档
+├── .models_cache/         # modelscope 模型缓存（2GB+，已 gitignore，不入库）
 ├── .venv/                 # 虚拟环境（已 gitignore，不入库）
 └── rapid_asr_models/      # RapidASR 模型（可选，已 gitignore，不入库）
 ```
@@ -283,8 +290,13 @@ FunASR/
 ## 10. 常见问题
 
 - **Q：麦克风没说话，也识别出文字？**
-  这是 Paraformer 的幻觉输出，本服务已用**静音门限**解决（见第 7 节）。
+  这是 Paraformer 的幻觉输出，本服务已用**基于 fsmn-vad 的静音门限**解决（见第 7 节）。
   若仍出现，可把阈值调高：`--min-speech-sec 0.3`；并确认没加 `--no-silence-gate`。
+- **Q：模型缓存跑到 C 盘、把 C 盘撑爆？**
+  本服务已把缓存固定到项目内 `D:\MyPro\FunASR\.models_cache`（modelscope 默认是
+  `C:\Users\<user>\.cache\modelscope`）。`asr_server.py` 用 `os.environ.setdefault(...)`
+  设定，`start_asr_server.bat` 用 `set "MODELSCOPE_CACHE=%~dp0.models_cache"` 设定；
+  如需换位置，外部设 `MODELSCOPE_CACHE` 即可覆盖（bat 会强制为项目目录）。
 - **Q：提示 `torch` 不是 CPU 版 / 想确认？**
   跑 `python -c "import torch; print(torch.__version__, torch.cuda.is_available())"`，
   版本带 `+cpu` 且 `cuda_available=False` 即为 CPU 版。

@@ -39,3 +39,4 @@ __pycache__/
 asr_result.txt
 *.log
 .cache/
+.models_cache/
