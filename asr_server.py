@@ -24,6 +24,13 @@
     .venv/Scripts/python.exe asr_server.py --no-punc   # 关闭标点恢复
     .venv/Scripts/python.exe asr_server.py --port 9000
     .venv/Scripts/python.exe asr_server.py --vad       # 加载 fsmn-vad，支持长音频
+    .venv/Scripts/python.exe asr_server.py --no-silence-gate   # 关闭静音门限
+
+静音门限（默认开启）：
+    Paraformer 对近乎空白的输入会产生幻觉文本（如 540ms 中 96% 静音的片段
+    被编成「这个这的这的e个。」）。服务端在推理前统计有效语音时长与占比，
+    低于门限的整段直接返回空文本，不喂给模型。门限可用 --min-speech-sec 调整，
+    或 --no-silence-gate 整体关闭。
 
 与 RapidASR 版（默认 18465）端口错开，两台服务可同时运行；
 客户端只需改端口号即可在两个引擎之间切换。
@@ -251,13 +258,76 @@ def _load_waveform(audio: bytes, sample_rate: int = TARGET_SR) -> np.ndarray:
     return waveform.astype(np.float32)[None, ...]
 
 
+# ---------------------------------------------------------------- 静音门限
+# Paraformer 对近乎空白的输入会产生「幻觉文本」：按下键到开口之间的空白、
+# 按键咔哒声，都可能被"编"成几个字（实测 540ms/静音 96% 的片段输出了
+# 「这个这的这的e个。」）。这里在推理前做能量门限：分帧求 RMS → 估噪声底 →
+# 统计有效语音时长与占比，低于门限的整段直接判为无语音，返回空文本。
+
+SILENCE_DBFS = -45.0  # 绝对门限：帧能量低于此值视为静音
+SPEECH_MARGIN_DB = 8.0  # 相对门限：需高出噪声底这么多 dB 才算有效语音
+MIN_SPEECH_SEC = 0.2  # 有效语音最短总时长（秒）
+MIN_SPEECH_RATIO = 0.05  # 有效语音最低占比
+
+_GATE_ENABLED = True
+
+
+def _speech_stats(waveform: np.ndarray) -> tuple[float, float]:
+    """能量门限统计。返回 (有效语音总时长秒, 有效语音帧占比)。
+
+    用累积和求滑动窗能量，O(n) 内存，长音频不会炸（25ms 窗 / 10ms 步）。
+    """
+    x = (waveform[0] if waveform.ndim > 1 else waveform).astype(np.float64)
+    if x.size == 0:
+        return 0.0, 0.0
+
+    frame = max(1, int(0.025 * TARGET_SR))  # 25ms
+    hop = max(1, int(0.010 * TARGET_SR))  # 10ms
+
+    if x.size < frame:
+        rms = float(np.sqrt(np.mean(x * x) + 1e-12))
+        voiced = (20 * np.log10(rms + 1e-10)) > SILENCE_DBFS
+        return (x.size / TARGET_SR if voiced else 0.0), (1.0 if voiced else 0.0)
+
+    csum = np.concatenate(([0.0], np.cumsum(x * x)))
+    starts = np.arange(0, x.size - frame + 1, hop)
+    ends = starts + frame
+    rms = np.sqrt((csum[ends] - csum[starts]) / frame + 1e-12)
+    dbfs = 20 * np.log10(rms)
+
+    # 以低分位数作噪声底，避免整段偏噪时把噪声当语音
+    threshold = max(SILENCE_DBFS, float(np.percentile(dbfs, 10)) + SPEECH_MARGIN_DB)
+    voiced = dbfs > threshold
+    return float(voiced.sum()) * hop / TARGET_SR, float(voiced.mean())
+
+
+def _has_speech(waveform: np.ndarray) -> bool:
+    """判断这段音频是否真的含有效语音；纯静音/噪声直接跳过推理。"""
+    if not _GATE_ENABLED:
+        return True
+    speech_sec, ratio = _speech_stats(waveform)
+    if speech_sec >= MIN_SPEECH_SEC and ratio >= MIN_SPEECH_RATIO:
+        return True
+    logger.info(
+        "判定为无有效语音，跳过推理：有效 %.2fs（占比 %.0f%%；门限 %.2fs / %.0f%%）",
+        speech_sec, ratio * 100, MIN_SPEECH_SEC, MIN_SPEECH_RATIO * 100,
+    )
+    return False
+
+
 def _infer(audios: list[np.ndarray]) -> tuple[list[str], int]:
-    """串行推理（funasr 模型非线程安全，加锁）。返回 (各段文本, 纯推理毫秒)。"""
+    """串行推理（funasr 模型非线程安全，加锁）。返回 (各段文本, 纯推理毫秒)。
+
+    静音段（能量门限未通过）不喂给模型，直接给空文本，避免幻觉输出。
+    """
     assert _model is not None
     texts: list[str] = []
     t0 = time.time()
     with _infer_lock:
         for wav in audios:
+            if not _has_speech(wav):
+                texts.append("")
+                continue
             res = _model.generate(input=wav[0])  # funasr 接收一维 float32 波形
             texts.append(res[0].get("text", "") if res else "")
     return texts, int((time.time() - t0) * 1000)
@@ -415,7 +485,7 @@ def health():
 
 
 def main() -> None:
-    global _model_name, _LOAD_VAD, _LOAD_PUNC
+    global _model_name, _LOAD_VAD, _LOAD_PUNC, _GATE_ENABLED, MIN_SPEECH_SEC
 
     parser = argparse.ArgumentParser(description="FunASR 本地 ASR 服务（CPU）")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址，默认仅本机")
@@ -423,11 +493,24 @@ def main() -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"funasr 模型名，默认 {DEFAULT_MODEL}")
     parser.add_argument("--vad", action="store_true", help="加载 fsmn-vad 支持长音频自动切分")
     parser.add_argument("--no-punc", action="store_true", help="关闭 ct-punc 标点恢复（默认开启断句）")
+    parser.add_argument(
+        "--no-silence-gate",
+        action="store_true",
+        help="关闭静音门限（默认开启：纯静音/噪声片段直接返回空文本，防模型幻觉）",
+    )
+    parser.add_argument(
+        "--min-speech-sec",
+        type=float,
+        default=MIN_SPEECH_SEC,
+        help=f"判定有语音所需的最短有效语音时长（秒），默认 {MIN_SPEECH_SEC}",
+    )
     args = parser.parse_args()
 
     _model_name = args.model
     _LOAD_VAD = args.vad
     _LOAD_PUNC = not args.no_punc
+    _GATE_ENABLED = not args.no_silence_gate
+    MIN_SPEECH_SEC = args.min_speech_sec
 
     import uvicorn
 
