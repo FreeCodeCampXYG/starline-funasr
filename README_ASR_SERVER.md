@@ -257,4 +257,6 @@ FunASR/
 
 ---
 
-> 分支：`starline-asr-server`（Fork 自 modelscope/FunASR，推到 FreeCodeCampXYG/FunASR）
+> 仓库：`FreeCodeCampXYG/starline-funasr`（Fork 自 modelscope/FunASR）。
+> 本仓库的 **`main` 分支即包含上述全部改动**（默认分支，访客进来看到的就是带 ASR 服务的版本），
+> 不向上游 modelscope/FunASR 提 PR/issue。本地推送命令见根目录 `push_to_github.bat`。
