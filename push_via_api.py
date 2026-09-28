@@ -79,6 +79,7 @@ COMMIT_MESSAGE = """feat: FunASR CPU 版 ASR 服务（断句 + PCM + 静音门�
 - test_silence_gate.py: 静音门限离线自测（7 个用例）
 - start_asr_server.bat: 一键启动（清端口旧进程 → 起服务 → 开 Swagger → pause）
 - push_to_github.bat / push_via_api.py: 推送到本 fork 的脚本
+- cleanup_branches.py: 清理 fork 中继承自上游的多余分支
 - static/: 离线 Swagger UI 资源（国内 CDN 不可达）
 - README_ASR_SERVER.md: CPU 部署、venv、依赖、接口与 Swagger 说明
 - .gitignore: 排除 .venv / rapid_asr_models / .workbuddy 等本地产物
