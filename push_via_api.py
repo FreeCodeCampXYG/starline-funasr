@@ -46,6 +46,20 @@ FILES = [
 
 GI_MARKER = "# === 本地环境"
 
+GIT_REF = "main"  # 优先从该本地分支的 git 对象取内容（已规范化行尾，避免与远端出现虚假 diff）
+
+
+def _git_show(rel: str) -> bytes | None:
+    """取本地 git 对象中某文件的内容（已按 core.autocrlf 规范化），失败返回 None。"""
+    out = subprocess.run(["git", "show", f"{GIT_REF}:{rel}"], capture_output=True)
+    return out.stdout if out.returncode == 0 else None
+
+
+def read_content(rel: str) -> bytes:
+    """文件内容：优先 git 对象（与本地提交一致，规避 CRLF/LF 差异），否则读磁盘。"""
+    data = _git_show(rel)
+    return data if data is not None else Path(rel).read_bytes()
+
 COMMIT_MESSAGE = """feat: FunASR CPU 版 ASR 服务（断句 + PCM + 静音门限）
 
 在官方 FunASR 之上增加一套本地 ASR 服务与命令行工具，面向 Windows + CPU 场景。
@@ -107,7 +121,8 @@ def build_gitignore(gh: GH, base_sha: str) -> bytes:
     """以远端 main 的 .gitignore 为基础，追加本地排除规则（不覆盖上游改动）。"""
     remote = gh.api(f"/contents/.gitignore?ref={base_sha}")
     remote_text = base64.b64decode(remote["content"]).decode("utf-8")
-    local_text = Path(".gitignore").read_text(encoding="utf-8")
+    local_bytes = _git_show(".gitignore") or Path(".gitignore").read_bytes()
+    local_text = local_bytes.decode("utf-8")
 
     idx = local_text.find(GI_MARKER)
     block = local_text[idx:].rstrip("\n") if idx >= 0 else ""
@@ -126,30 +141,42 @@ def main() -> None:
     parser.add_argument("--branch", default="main", help="目标分支，默认 main")
     parser.add_argument("--message", default=COMMIT_MESSAGE, help="提交信息")
     parser.add_argument("--dry-run", action="store_true", help="只列出将推送的文件")
+    parser.add_argument(
+        "--squash",
+        action="store_true",
+        help="以远端分支头的父提交为 base 重建提交并强制更新（保持分支上只有一个本次提交）",
+    )
     args = parser.parse_args()
 
     missing = [f for f in FILES if not Path(f).is_file()]
     if missing:
         sys.exit(f"以下文件不存在：{missing}")
 
-    total = sum(Path(f).stat().st_size for f in FILES)
+    sizes = {f: len(read_content(f)) for f in FILES}
+    total = sum(sizes.values())
     print(f"仓库 {args.repo} / 分支 {args.branch}")
-    print(f"待推送 {len(FILES)} 个文件，合计 {total / 1024 / 1024:.2f} MB")
+    print(f"待推送 {len(FILES)} 个文件，合计 {total / 1024 / 1024:.2f} MB（内容取自 git 对象 {GIT_REF}）")
     for f in FILES:
-        print(f"  + {f}  ({Path(f).stat().st_size / 1024:.0f} KB)")
+        print(f"  + {f}  ({sizes[f] / 1024:.0f} KB)")
     if args.dry_run:
         return
 
     gh = GH(args.repo, gh_token())
 
-    ref = gh.api(f"/git/ref/heads/{args.branch}")
-    base_sha = ref["object"]["sha"]
+    head_sha = gh.api(f"/git/ref/heads/{args.branch}")["object"]["sha"]
+    if args.squash:
+        # 以远端分支头的父提交为 base，配合 force 更新 → 分支上只留本次提交
+        base_sha = gh.api(f"/git/commits/{head_sha}")["parents"][0]["sha"]
+        force = True
+    else:
+        base_sha = head_sha
+        force = False
     base_tree = gh.api(f"/git/commits/{base_sha}")["tree"]["sha"]
-    print(f"\n远端 {args.branch} 当前 = {base_sha[:8]}")
+    print(f"\n远端 {args.branch} 当前 = {head_sha[:8]}，base = {base_sha[:8]}（force={force}）")
 
     entries = []
     for rel in FILES:
-        content = build_gitignore(gh, base_sha) if rel == ".gitignore" else Path(rel).read_bytes()
+        content = build_gitignore(gh, base_sha) if rel == ".gitignore" else read_content(rel)
         blob = gh.api(
             "/git/blobs",
             "POST",
@@ -170,7 +197,7 @@ def main() -> None:
     )
     print(f"  commit -> {commit['sha'][:8]}")
 
-    gh.api(f"/git/refs/heads/{args.branch}", "PATCH", {"sha": commit["sha"], "force": False})
+    gh.api(f"/git/refs/heads/{args.branch}", "PATCH", {"sha": commit["sha"], "force": force})
     print(f"\n完成：https://github.com/{args.repo}/commit/{commit['sha']}")
     print(f"分支视图：https://github.com/{args.repo}/tree/{args.branch}")
 
